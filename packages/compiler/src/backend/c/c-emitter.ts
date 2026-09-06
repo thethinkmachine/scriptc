@@ -21,6 +21,7 @@ import { InternalCompilerError } from "../../errors.js";
  * The generated C is a debugging surface: locals keep their TS names inside
  * the mangled form and every statement carries a `source line` comment.
  */
+import type { IntegerIndexNode } from "../../ir/integer-loops.js";
 import type {
   IrBytesElem,
   IrGlobal,
@@ -42,6 +43,7 @@ import type {
 } from "../../ir/ir.js";
 import { ffiCallbackType, funcOf, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, mapOf, moduleEmbedsCompressedNpm, moduleUsesDgram, moduleUsesDynInvoke, moduleEmbedsBuiltin, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, moduleUsesTls, moduleUsesTlsCa, POINTER_KINDS, type PointerKind, RUNTIME_EMITTER_CLASS, STRING, VOID } from "../../ir/ir.js";
 import { undefinedArmTag } from "../../ir/analysis.js";
+import { collectIntegerGlobals, integerIndexExpr, renderIntegerIndexC } from "../../ir/integer-loops.js";
 import { allocateFfiCallbackAdapters, hasForeignFfiCallback, hasRetainedFfiCallback, type FfiCallbackAdapter } from "../ffi-callbacks.js";
 import {
   mangleAsyncSpawn,
@@ -162,6 +164,17 @@ export class CEmitter {
    * program. Keeping these in the generated TU means unrelated binaries do
    * not pay even debug/link metadata for byte-loop fast paths. */
   readonly bytesElementHelpers = new Set<`${"get" | "set"}:${IrBytesElem}:${"f64" | "u64"}`>();
+  /** Element-kind-specialized ScrArr access helpers actually used by this
+   * program, mirroring bytesElementHelpers. `number[]`/`boolean[]` element
+   * traffic is the hottest thing a numeric program does, and a call into
+   * the runtime archive is opaque to the optimizer: it cannot hoist
+   * `a->data`/`a->len` out of a loop, cannot keep them in registers, and
+   * must treat every element access as a full memory clobber. Emitting the
+   * checked fast path into THIS translation unit restores all of that
+   * (the cold OOB path still calls the runtime so the trap message stays
+   * byte-identical). Ref elements keep the runtime call: their retain and
+   * unlink-then-release discipline belongs with the collector. */
+  readonly arrElementHelpers = new Set<`${"get" | "set"}:${"f64" | "bool"}:${"f64" | "u64"}`>();
   /** Interned unit-armed union instances: "unionId:tag" → static symbol.
    * A unit arm (undefined/null) has no payload, so every instance of one
    * (union, tag) pair is identical — ONE immortal (rc == SIZE_MAX) static
@@ -199,7 +212,11 @@ export class CEmitter {
   /** Canonical byte-loop induction locals currently represented by an
    * unsigned integer shadow. Ordinary number reads widen the shadow back to
    * f64; direct byte indices consume it without a conversion round trip. */
-  integerLoopBindings = new Map<string, string>();
+  integerLoopBindings = new Map<string, { code: string; max: number }>();
+  /** localId → proven non-negative integer f64 binding (emitted C name and
+   * static upper bound), populated as immutable declarations are emitted.
+   * Feeds integerIndex so `const idx = i * N + j` indexes in integers. */
+  integerBindings = new Map<string, { max: number }>();
   /** Declared functions referenced as values: each needs an env-signature
    * wrapper + an interned immortal closure (so `f === f` holds). */
   readonly fnValues = new Set<string>();
@@ -447,6 +464,12 @@ export class CEmitter {
     this.mayThrow = mt.fns;
     this.indirectMayThrow = mt.indirect;
     for (const g of mod.globals ?? []) this.globalsById.set(g.id, g);
+    // Integer `const` globals are loop bounds and matrix strides; seeding
+    // them here is what lets `i < N` become an integer loop and
+    // `i * N + j` an integer index.
+    for (const [id, bound] of collectIntegerGlobals(mod)) {
+      this.integerBindings.set(id, bound);
+    }
     for (const u of mod.unions ?? []) this.unionsById.set(u.id, u);
     for (const r of mod.records ?? []) this.recordsById.set(r.id, r);
     // The class graph. Link base/children, number the forest in preorder
@@ -664,6 +687,7 @@ export class CEmitter {
       ``,
     ];
     out.push(...this.emitBytesElementHelpers());
+    out.push(...this.emitArrElementHelpers());
     // Struct defs render into their own buffer BEFORE the unit-instance
     // table flushes: class newFns point undefined-armed union fields at
     // interned unit instances (fields start as JS's undefined, not NULL),
@@ -1443,7 +1467,104 @@ export class CEmitter {
   /* ── plumbing ─────────────────────────────────────────────────────── */
 
   integerLoopIndex(expr: IrExpr): string | null {
-    return expr.kind === "varRef" ? this.integerLoopBindings.get(expr.localId) ?? null : null;
+    return expr.kind === "varRef" ? this.integerLoopBindings.get(expr.localId)?.code ?? null : null;
+  }
+
+  /** A uint64_t C expression for `expr` when its value is provably a
+   * non-negative integer below 2^53, else null. Beyond a bare induction
+   * variable this folds the integer arithmetic that indexes flattened
+   * matrices (`i * N + j`), so the address math stays in integers and the
+   * element accessor needs one unsigned compare instead of the full
+   * negative/fractional/range check. See integerIndexExpr. */
+  integerIndex(expr: IrExpr): string | null {
+    const value = integerIndexExpr(expr, this);
+    return value === null ? null : this.renderIntegerIndex(value.node);
+  }
+
+  /** Render a proven-integer index against this emitter's storage: loop
+   * shadows are already uint64_t locals; every other binding is the
+   * ordinary double local or global, converted at the use. */
+  renderIntegerIndex(node: IntegerIndexNode): string {
+    return renderIntegerIndexC(
+      node,
+      (id) => this.integerLoopBindings.get(id)!.code,
+      (id) => (this.currentLocals.has(id) ? mangleLocal(id) : mangleGlobal(id)),
+    );
+  }
+
+  /** Name the specialized ScrArr accessor for this element access, and
+   * record that the generated TU must define it. `acc` is the elemAccess
+   * kind; only "f64" and "bool" have a fast path (see arrElementHelpers). */
+  arrElementHelper(op: "get" | "set", acc: "f64" | "bool", integerIndex = false): string {
+    const mode = integerIndex ? "u64" : "f64";
+    this.arrElementHelpers.add(`${op}:${acc}:${mode}`);
+    return `sc_arr_${op}_${acc}${integerIndex ? "_u64" : ""}`;
+  }
+
+  private emitArrElementHelpers(): string[] {
+    if (this.arrElementHelpers.size === 0) return [];
+    const keys = [...this.arrElementHelpers];
+    const out = [`/* ScrArr hot paths specialized from the IR element kind. */`];
+    if (keys.some((k) => k.endsWith(":f64"))) {
+      // Bounds FIRST, conversion second: (size_t)i on a negative, NaN, or
+      // out-of-range double is undefined behaviour, so the guard must
+      // establish 0 <= i < limit before the cast. The round trip through
+      // double then rejects fractional indices without calling trunc().
+      // limit is len for reads and len + 1 for writes (i == len appends).
+      out.push(
+        `static inline size_t sc_arr_index_checked(const ScrArr *a, double i, size_t limit) {`,
+        `  if (!(i >= 0.0 && i < (double)limit)) { scr_arr_trap_index(i, a->len); }`,
+        `  size_t idx = (size_t)i;`,
+        `  if ((double)idx != i) { scr_arr_trap_index(i, a->len); }`,
+        `  return idx;`,
+        `}`,
+      );
+    }
+    if (keys.some((k) => k.endsWith(":u64"))) {
+      out.push(
+        `static inline size_t sc_arr_index_u64_checked(const ScrArr *a, uint64_t i, size_t limit) {`,
+        `  if (i >= limit) { scr_arr_trap_index((double)i, a->len); }`,
+        `  return (size_t)i;`,
+        `}`,
+      );
+    }
+    for (const acc of ["f64", "bool"] as const) {
+      for (const mode of ["f64", "u64"] as const) {
+        const suffix = mode === "u64" ? "_u64" : "";
+        const indexType = mode === "u64" ? "uint64_t" : "double";
+        const checked = mode === "u64" ? "sc_arr_index_u64_checked" : "sc_arr_index_checked";
+        const valueType = acc === "f64" ? "double" : "bool";
+        if (this.arrElementHelpers.has(`get:${acc}:${mode}`)) {
+          const load =
+            acc === "f64"
+              ? [`  double v;`, `  memcpy(&v, &a->data[idx], sizeof v);`, `  return v;`]
+              : [`  return a->data[idx] != 0;`];
+          out.push(
+            `static inline ${valueType} sc_arr_get_${acc}${suffix}(const ScrArr *a, ${indexType} i) {`,
+            `  size_t idx = ${checked}(a, i, a->len);`,
+            ...load,
+            `}`,
+          );
+        }
+        if (this.arrElementHelpers.has(`set:${acc}:${mode}`)) {
+          // i == len appends, which may grow the backing store — that stays
+          // in the runtime (one cold branch, not the loop body).
+          const store =
+            acc === "f64"
+              ? [`  uint64_t slot;`, `  memcpy(&slot, &v, sizeof slot);`, `  a->data[idx] = slot;`]
+              : [`  a->data[idx] = v ? 1u : 0u;`];
+          out.push(
+            `static inline void sc_arr_set_${acc}${suffix}(ScrArr *a, ${indexType} i, ${valueType} v) {`,
+            `  size_t idx = ${checked}(a, i, a->len + 1u);`,
+            `  if (idx == a->len) { scr_arr_set_${acc}(a, (double)idx, v); return; }`,
+            ...store,
+            `}`,
+          );
+        }
+      }
+    }
+    out.push("");
+    return out;
   }
 
   bytesElementHelper(op: "get" | "set", elem: IrBytesElem, integerIndex = false): string {
@@ -1475,7 +1596,10 @@ export class CEmitter {
         `}`,
       );
     }
-    if ([...this.bytesElementHelpers].some((key) => key.startsWith("set:") && key.split(":")[1] !== "f32")) {
+    if ([...this.bytesElementHelpers].some((key) => {
+      const elem = key.split(":")[1];
+      return key.startsWith("set:") && elem !== "f32" && elem !== "f64";
+    })) {
       out.push(
         `static inline uint32_t sc_bytes_coerce_u32(double v) {`,
         `  if (v >= -9007199254740992.0 && v <= 9007199254740992.0) return (uint32_t)(int64_t)v;`,
@@ -1486,7 +1610,7 @@ export class CEmitter {
         `}`,
       );
     }
-    for (const elem of ["u8", "u32", "i32", "f32"] as const) {
+    for (const elem of ["u8", "u32", "i32", "f32", "f64"] as const) {
       for (const mode of ["f64", "u64"] as const) {
         const suffix = mode === "u64" ? "_u64" : "";
         const indexType = mode === "u64" ? "uint64_t" : "double";
@@ -1496,6 +1620,16 @@ export class CEmitter {
             out.push(
               `static inline double sc_bytes_get_u8${suffix}(const ScrBytes *b, ${indexType} i) {`,
               `  return (double)b->data[${checked}(b, i)];`,
+              `}`,
+            );
+          } else if (elem === "f64") {
+            // The one 8-byte kind; the value IS the element, so the read is
+            // a plain load with no widening conversion.
+            out.push(
+              `static inline double sc_bytes_get_f64${suffix}(const ScrBytes *b, ${indexType} i) {`,
+              `  double v;`,
+              `  memcpy(&v, b->data + ${checked}(b, i) * 8, 8);`,
+              `  return v;`,
               `}`,
             );
           } else {
@@ -1514,6 +1648,14 @@ export class CEmitter {
             out.push(
               `static inline void sc_bytes_set_u8${suffix}(ScrBytes *b, ${indexType} i, double v) {`,
               `  b->data[${checked}(b, i)] = (uint8_t)sc_bytes_coerce_u32(v);`,
+              `}`,
+            );
+          } else if (elem === "f64") {
+            // No coercion: Float64Array stores the double as-is, NaN
+            // included (JS does not canonicalize a typed-array write).
+            out.push(
+              `static inline void sc_bytes_set_f64${suffix}(ScrBytes *b, ${indexType} i, double v) {`,
+              `  memcpy(b->data + ${checked}(b, i) * 8, &v, 8);`,
               `}`,
             );
           } else {

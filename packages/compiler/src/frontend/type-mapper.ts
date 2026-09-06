@@ -429,7 +429,11 @@ export function formatIrType(t: IrType, shapes: ShapeRegistry, unions: UnionRegi
     case "bytes":
       // The u8 kind reads as Uint8Array (Buffer maps here too — one
       // runtime representation; the message stays honest either way).
-      return t.elem === "u8" ? "Uint8Array" : t.elem === "u32" ? "Uint32Array" : t.elem === "i32" ? "Int32Array" : "Float32Array";
+      return t.elem === "u8" ? "Uint8Array"
+        : t.elem === "u32" ? "Uint32Array"
+        : t.elem === "i32" ? "Int32Array"
+        : t.elem === "f64" ? "Float64Array"
+        : "Float32Array";
     case "map":
       return `Map<${formatIrType(t.key, shapes, unions, seen)}, ${formatIrType(t.value, shapes, unions, seen)}>`;
     case "set":
@@ -1684,6 +1688,10 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
   // SharedArrayBuffer, and the i32 semantics hold for every other use.
   if (isStdlibInterface("Int32Array")) return bytesOf("i32");
   if (isStdlibInterface("Float32Array")) return bytesOf("f32");
+  // Float64Array: the only 8-byte element kind, and the natural type for
+  // numeric kernels — element writes store the double losslessly (no
+  // ToUint32 wrap, no float rounding).
+  if (isStdlibInterface("Float64Array")) return bytesOf("f64");
   // DataView: the ONE view kind — a u8 bytes value whose runtime
   // representation borrows (aliases) its owner's storage, so reads through
   // it see writes to the source exactly like JS. The checker keeps the

@@ -5,7 +5,7 @@ import { InternalCompilerError } from "../../errors.js";
  * method surfaces. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesOf, funcOf, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/ir.js";
+import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, IrExpr, IrFunction, IrLocal, IrMapIntrinsicMethod, IrParam, IrRecordShape, IrSetIntrinsicMethod, IrStmt, IrType, JSVAL, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, bytesElemWidth, bytesOf, funcOf, isRefCounted, isSupportedArrayElem, isSupportedIndexValue, isUnitType, typeEquals } from "../../ir/ir.js";
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
 import { droppableStatic, isRequireMainFilename, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
@@ -5099,13 +5099,14 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
 /* ── typed arrays / Buffer ─────────────────────────────────────────────── */
 
 /** The typed-array constructors with a runtime representation, by lib
- * interface name. The other TypedArray flavors (Int8Array, Float64Array,
+ * interface name. The other TypedArray flavors (Int8Array, Uint16Array,
  * DataView, ...) fall through to the generic stdlib-constructor fence. */
 const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
   Uint8Array: "u8",
   Uint32Array: "u32",
   Int32Array: "i32",
   Float32Array: "f32",
+  Float64Array: "f64",
 };
 
 /** `new Uint8Array(...)` / `new Uint32Array(...)` / `new Float32Array(...)`
@@ -5166,7 +5167,7 @@ const BYTES_CTORS: Record<string, IrBytesElem | undefined> = {
               "erases into the view): drop the options bag",
           );
         }
-        const elemSize = elem === "u8" ? 1 : 4;
+        const elemSize = bytesElemWidth(elem);
         const lenArg = argNode.arguments?.length === 1 ? argNode.arguments[0] : undefined;
         const lenT = lenArg ? lowerer.typeOf(lenArg) : null;
         const byteLen = lenT?.isNumberLiteralType() ? lenT.value : null;

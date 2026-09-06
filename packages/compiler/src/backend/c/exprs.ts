@@ -3,7 +3,7 @@ import { InternalCompilerError } from "../../errors.js";
  * expression lands in a fresh C temp, with RC ownership tracked on the
  * emitter's frames (see the discipline comment in emitter core). */
 import type { CEmitter, Temp } from "./c-emitter.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrLibFn, IrRecordShape, IrType, islandPromisePayloadTag, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals, typeKey } from "../../ir/ir.js";
+import { arrayOf, BOOL, bytesElemWidth, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrLibFn, IrRecordShape, IrType, islandPromisePayloadTag, isFfiCallbackParam, isFfiContextParam, isFfiReleaseParam, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals, typeKey } from "../../ir/ir.js";
 import { boxAccess, BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, releaseCallC, retainCallC, vAdapters } from "./types.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mangleFnClosure, mangleFunction, mangleGlobal, mangleLocal, mangleRecordClone, mangleRecordNew, mangleRecordStruct, mangleVtStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./shapes.js";
@@ -478,6 +478,29 @@ function dynPromiseAdapter(
  * owner then keeps the value alive, avoiding retain/release traffic around
  * every indexed access. Any uncertain shape falls back to an owned temp. */
 export function emitBytesReceiver(emitter: CEmitter, receiver: IrExpr, following: IrExpr[]): Temp {
+  if (
+    receiver.kind === "varRef" &&
+    following.every((operand) => isStableBytesOperand(operand, receiver.localId))
+  ) {
+    const local = emitter.currentLocals.get(receiver.localId);
+    if (local && !local.boxed) {
+      return emitter.newBorrowedTemp(receiver.type, mangleLocal(receiver.localId));
+    }
+    if (!local && emitter.globalsById.has(receiver.localId)) {
+      return emitter.newBorrowedTemp(receiver.type, mangleGlobal(receiver.localId));
+    }
+  }
+  return emitter.emitExpr(receiver);
+}
+
+/** Evaluate an ARRAY receiver as a borrow under the same rule as
+ * emitBytesReceiver: a direct, unboxed binding whose owner (its scope or
+ * the globals table) outlives the access, with no later operand able to
+ * reassign it. Element traffic in a numeric kernel is otherwise dominated
+ * by the retain/release pair around every access — scr_arr_release is an
+ * out-of-line call, so each one also acts as an optimizer barrier that
+ * forces `a->data`/`a->len` to be reloaded on the next iteration. */
+export function emitArrayReceiver(emitter: CEmitter, receiver: IrExpr, following: IrExpr[]): Temp {
   if (
     receiver.kind === "varRef" &&
     following.every((operand) => isStableBytesOperand(operand, receiver.localId))
@@ -1541,16 +1564,23 @@ function emitContainerExpr(
         return arr;
       }
       case "arrayGet": {
-        const arr = emitter.emitExpr(e.arr);
-        const idx = emitter.emitExpr(e.index);
+        const arr = emitArrayReceiver(emitter, e.arr, [e.index]);
         if (e.arr.type.kind !== "array") throw new InternalCompilerError("emitter bug: arrayGet on non-array");
         // Ref-element reads return +1 (the runtime retains); newTemp
-        // registers the owned temp in the frame like any other.
+        // registers the owned temp in the frame like any other. Scalar
+        // elements take the TU-local inline accessor instead of a call
+        // into the runtime archive, so the optimizer can see the load.
         const acc = elemAccess(e.arr.type.elem);
-        return emitter.newTemp(e.type, `scr_arr_get_${acc}(${arr.name}, ${idx.name})`);
+        const integerIndex = acc === "ref" ? null : emitter.integerIndex(e.index);
+        // A proven-integer index replaces the double form outright — the
+        // shapes it accepts are side-effect-free, so nothing is skipped.
+        const idx = integerIndex ?? emitter.emitExpr(e.index).name;
+        if (acc === "ref") return emitter.newTemp(e.type, `scr_arr_get_ref(${arr.name}, ${idx})`);
+        const helper = emitter.arrElementHelper("get", acc, integerIndex !== null);
+        return emitter.newTemp(e.type, `${helper}(${arr.name}, ${idx})`);
       }
       case "arrIntrinsic": {
-        const r = emitter.emitExpr(e.receiver);
+        const r = emitArrayReceiver(emitter, e.receiver, e.args);
         if (e.receiver.type.kind !== "array") throw new InternalCompilerError("emitter bug: arrIntrinsic on non-array");
         const acc = elemAccess(e.receiver.type.elem);
         const method = e.method;
@@ -1768,7 +1798,7 @@ function emitContainerExpr(
         const r = directElementAccess
           ? emitBytesReceiver(emitter, e.receiver, e.args)
           : emitter.emitExpr(e.receiver);
-        const integerIndex = method === "get" ? emitter.integerLoopIndex(e.args[0]!) : null;
+        const integerIndex = method === "get" ? emitter.integerIndex(e.args[0]!) : null;
         const args = integerIndex === null ? e.args.map((a) => emitter.emitExpr(a)) : [];
         switch (method) {
           case "length":
@@ -1777,9 +1807,11 @@ function emitContainerExpr(
             if (e.receiver.type.kind !== "bytes") {
               throw new InternalCompilerError("emitter bug: bytesIntrinsic byteLength on non-bytes");
             }
+            // The ELEMENT count scaled by the element width: 1, 4, or 8
+            // bytes (u8, the 32-bit kinds, f64).
             return emitter.newTemp(
               e.type,
-              `(double)(${r.name}->len * ${e.receiver.type.elem === "u8" ? "1" : "4"})`,
+              `(double)(${r.name}->len * ${bytesElemWidth(e.receiver.type.elem)})`,
             );
           case "get":
             // Any invalid index traps (the array runtime's discipline).

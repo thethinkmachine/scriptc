@@ -120,7 +120,12 @@ export interface LlvmEmitterContext extends ShapeHost {
   fsRenameThunkFor(cbT: IrType & { kind: "func" }): string;
   genResultThunkFor(genT: IrType & { kind: "generator" }, recT: IrType & { kind: "record" }): string;
   indirectMayThrow: boolean;
-  integerLoopBindings: Map<string, string>;
+  /** localId → the integer induction shadow's alloca slot and the bound the
+   * loop condition proves (see ir/integer-loops.ts). */
+  integerLoopBindings: Map<string, { slot: string; max: number }>;
+  /** localId → an ordinary f64 binding proven to hold a non-negative
+   * integer, with its bound. */
+  integerBindings: Map<string, { max: number }>;
   internLiteral(text: string): string;
   islandAdapter(arity: number, retKind: "void" | "jsval" | "f64" | "bool" | "string"): string;
   islandTypedAdapter(fn: IrType & { kind: "func" }): string;

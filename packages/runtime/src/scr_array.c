@@ -19,7 +19,7 @@ static void scr_arr_oom(void) {
 /* JS would return undefined for an OOB read and create holes for a far OOB
  * write; both are unrepresentable here (see SEMANTICS.md), so any invalid
  * index — negative, fractional, NaN, or past the allowed end — traps. */
-static void scr_arr_trap_oob(double i, size_t len) {
+_Noreturn void scr_arr_trap_index(double i, size_t len) {
   char buf[32];
   scr_f64_to_str(i, buf);
   scr_trap_fmt("scriptc: RangeError: array index %s out of bounds (length %zu)\n",
@@ -32,7 +32,7 @@ static void scr_arr_trap_oob(double i, size_t len) {
 static size_t scr_arr_check_index(const ScrArr *a, double i, bool allow_append) {
   size_t limit = a->len + (allow_append ? 1 : 0);
   if (!(i >= 0) || i != trunc(i) || i >= (double)limit) {
-    scr_arr_trap_oob(i, a->len);
+    scr_arr_trap_index(i, a->len);
   }
   return (size_t)i;
 }

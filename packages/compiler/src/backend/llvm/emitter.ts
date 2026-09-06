@@ -80,7 +80,7 @@ import type {
   SrcLoc,
 } from "../../ir/ir.js";
 import { CAUGHT, ffiCallbackType, isFfiContextParam, isRefCounted, isUnitType, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesDynInvoke, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, moduleUsesTls, moduleUsesTlsCa, NPM_COMPRESS_MIN, POINTER_KINDS, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, VOID } from "../../ir/ir.js";
-import { matchIntegerBytesForLoop } from "../../ir/integer-loops.js";
+import { collectIntegerGlobals, integerIndexExpr, matchIntegerForLoop } from "../../ir/integer-loops.js";
 import { allocateFfiCallbackAdapters, hasForeignFfiCallback, hasRetainedFfiCallback, type FfiCallbackAdapter } from "../ffi-callbacks.js";
 import { RUNTIME_ABI_MARKER } from "../runtime-abi.js";
 import { computeMayThrow } from "../c/may-throw.js";
@@ -97,7 +97,8 @@ import { emitJsMarshal, emitJsOp, emitJsExit, islandAdapter, islandTypedAdapter 
 import { dynKind, raceAdapterFor, genResultThunkFor, childExitThunkFor, childExitSignalThunkFor, childDataThunkFor, emitterFixedAdapter, wrapEmitterListener, unwrapNullableClosure, closeBindThunkFor, closeOverrideWrapFor } from "./expr-callbacks.js";
 import { streamDataAdapter, streamDoneFnFor, fsRenameThunkFor, streamCbThunkFor } from "./expr-stream-callbacks.js";
 import { resolveThunkFor, tagInSet, arrPush, emitArrayCopyLoop, emitStrIntrinsic, emitArrIntrinsic, wrapNullable, emitMapNew, mapSet, emitMapLikeIntrinsic, emitSetNew } from "./expr-containers.js";
-import { emitBytesReceiver, emitIntegerLoopIndex, emitBytesIndex, emitBytesData, emitBytesLength, emitBytesGet, emitBytesU32, emitBytesSet, emitBytesIntrinsic } from "./expr-bytes.js";
+import { emitArrSetScalar, emitIntegerIndex, renderIntegerIndex } from "./expr-array-elem.js";
+import { emitBytesReceiver, emitBytesIndex, emitBytesData, emitBytesLength, emitBytesGet, emitBytesU32, emitBytesSet, emitBytesIntrinsic } from "./expr-bytes.js";
 import { emitRegexIntrinsic, emitRecordKeyGet, keyedRecordReadInto } from "./expr-records.js";
 import { dynPromiseAdapter, streamTypedRefCommitAdapter, liveDynUnionRefAdapter, streamTypedRefBoxValue, streamTypedRefMaterializeAdapter, streamFromArrayAdapter } from "./expr-stream-bridges.js";
 import { emitWebLibCall, emitDynamicLibCall, emitFilesystemLibCall, emitPathUrlLibCall, emitPrimitiveLibCall } from "./lib-filesystem.js";
@@ -331,7 +332,12 @@ class LlEmitter {
   private currentLocals = new Map<string, IrLocal>();
   private captureIds = new Set<string>();
   /** Active canonical byte-loop induction bindings: local id → size_t slot. */
-  private integerLoopBindings = new Map<string, string>();
+  integerLoopBindings = new Map<string, { slot: string; max: number }>();
+  /** localId → an f64 binding proven to hold a non-negative integer below
+   * 2^53, so index arithmetic over it can stay in integers. Seeded with the
+   * module's integer `const` globals and extended at each qualifying
+   * declaration. */
+  integerBindings = new Map<string, { max: number }>();
   /** Enclosing try-with-FINALLY regions, innermost last: a `return`
    * inside one runs every crossed finally (innermost first) before the
    * actual ret — the C emitter's pending-return path, with the finally
@@ -399,6 +405,10 @@ class LlEmitter {
     const traced = computeTraced(mod);
     this.tracedShapes = traced.shapes;
     this.tracedUnions = traced.unions;
+    // Integer `const` globals are loop bounds and matrix strides; seeding
+    // them here is what lets `i < N` become an integer loop and
+    // `i * N + j` an integer index (C emitter parity).
+    for (const [id, bound] of collectIntegerGlobals(mod)) this.integerBindings.set(id, bound);
     for (const g of mod.globals ?? []) {
       // Module globals: scalar (f64/bool) storage is a zero-initialized
       // LLVM global, ref-kind storage a null-initialized ptr — load/store
@@ -2860,6 +2870,11 @@ class LlEmitter {
     this.currentLocals = new Map(fn.locals.map((l) => [l.id, l]));
     this.captureIds = new Set((fn.captures ?? []).map((c) => c.localId));
     this.integerLoopBindings.clear();
+    // Integer `const` GLOBALS stay seeded across functions; only the
+    // per-function local bindings are dropped.
+    for (const id of [...this.integerBindings.keys()]) {
+      if (!id.startsWith("%g.")) this.integerBindings.delete(id);
+    }
     this.chainSlots.clear();
     this.finallyStack = [];
     this.tryStack = [];
@@ -3078,9 +3093,16 @@ class LlEmitter {
           }
           break;
         }
+        // A `const` whose initializer is a proven non-negative integer
+        // keeps that fact at every later use, so `const idx = i * N + j`
+        // still indexes in integers (C backend's varDecl).
+        const integerBound = b.local && !b.local.mutable && b.local.boxed !== true && b.type.kind === "f64"
+          ? integerIndexExpr(s.init, this)
+          : null;
         const v = this.emitExpr(s.init);
         this.moveTemp(v);
         B.line(`store ${this.llType(b.type)} ${v.name}, ptr ${b.slot}`);
+        if (integerBound) this.integerBindings.set(s.localId, { max: integerBound.max });
         if (isRefCounted(b.type)) {
           this.scopes[this.scopes.length - 1]!.push({ slot: b.slot, type: b.type });
         }
@@ -3123,15 +3145,24 @@ class LlEmitter {
         // Evaluation order matches JS: array, index, then value. Ownership
         // of a refcounted value moves into the array (the runtime releases
         // the replaced element itself).
+        if (s.arr.type.kind !== "array") throw new InternalCompilerError("llvm emitter bug: arraySet on non-array");
+        const acc = elemAccess(s.arr.type.elem);
+        if (acc !== "ref") {
+          // Scalar stores: borrow the receiver and inline the checked
+          // store (the appending i == len case calls the runtime).
+          const recv = emitBytesReceiver(this.expressionContext(), s.arr, [s.index, s.value]);
+          const integerIndex = emitIntegerIndex(this.expressionContext(), s.index);
+          const idxName = integerIndex ?? this.emitExpr(s.index).name;
+          const value = this.emitExpr(s.value);
+          emitArrSetScalar(this.expressionContext(), acc, recv.name, idxName, value.name, integerIndex !== null);
+          break;
+        }
         const arr = this.emitExpr(s.arr);
         const idx = this.emitExpr(s.index);
         const v = this.emitExpr(s.value);
-        if (s.arr.type.kind !== "array") throw new InternalCompilerError("llvm emitter bug: arraySet on non-array");
-        const acc = elemAccess(s.arr.type.elem);
-        if (acc === "ref") this.moveTemp(v);
-        const argTy = acc === "f64" ? "double" : acc === "bool" ? "i1" : "ptr";
-        this.declare(`declare void @scr_arr_set_${acc}(ptr, double, ${argTy === "i1" ? "i1 zeroext" : argTy})`);
-        B.line(`call void @scr_arr_set_${acc}(ptr ${arr.name}, double ${idx.name}, ${argTy} ${v.name})`);
+        this.moveTemp(v);
+        this.declare(`declare void @scr_arr_set_ref(ptr, double, ptr)`);
+        B.line(`call void @scr_arr_set_ref(ptr ${arr.name}, double ${idx.name}, ptr ${v.name})`);
         break;
       }
       case "bytesSet": {
@@ -3396,14 +3427,14 @@ class LlEmitter {
       case "for": {
         // The init's scope wraps the whole loop (break/continue must NOT
         // release it — scopeDepth captured after the push, C parity).
-        const integerLoop = matchIntegerBytesForLoop(s, this.currentLocals);
+        const integerLoop = matchIntegerForLoop(s, this.currentLocals, this);
         this.scopes.push([]);
         let integerSlot: string | null = null;
         if (integerLoop) {
           integerSlot = B.slot();
           B.entryAllocas.push(`${integerSlot} = alloca ${this.sizeType} ; integer induction ${this.currentLocals.get(integerLoop.localId)!.name}`);
           B.line(`store ${this.sizeType} 0, ptr ${integerSlot}`);
-          this.integerLoopBindings.set(integerLoop.localId, integerSlot);
+          this.integerLoopBindings.set(integerLoop.localId, { slot: integerSlot, max: integerLoop.max });
         } else if (s.init) {
           this.emitStmt(s.init);
         }
@@ -3420,7 +3451,17 @@ class LlEmitter {
         const lu = s.update || freshens ? B.newLabel("loop.u") : lc;
         B.br(lc);
         B.startBlock(lc);
-        if (integerLoop && integerSlot) {
+        if (integerLoop && integerSlot && integerLoop.limitExpr) {
+          // A general proven-integer limit, re-evaluated per iteration as
+          // JS does; both sides are exact integers below 2^53, so the
+          // unsigned test is the double test.
+          const limit = renderIntegerIndex(this.expressionContext(), integerIndexExpr(integerLoop.limitExpr, this)!.node);
+          const index = B.tmp();
+          const inBounds = B.tmp();
+          B.line(`${index} = load ${this.sizeType}, ptr ${integerSlot}`);
+          B.line(`${inBounds} = icmp ult ${this.sizeType} ${index}, ${limit}`);
+          B.condBr(inBounds, lb, le);
+        } else if (integerLoop && integerSlot && integerLoop.limitReceiver) {
           const receiver = this.emitBytesReceiver(integerLoop.limitReceiver, []);
           const lenPtr = B.tmp();
           const len = B.tmp();
@@ -4163,8 +4204,11 @@ class LlEmitter {
     return emitBytesReceiver(this.expressionContext(), receiver, following);
   }
 
+  /** The generalized proven-integer index (ir/integer-loops.ts), shared by
+   * typed-array and ScrArr element access. Named for the interface slot it
+   * fills; the narrow loop-shadow-only rule it replaced is a subset. */
   private emitIntegerLoopIndex(expr: IrExpr): string | null {
-    return emitIntegerLoopIndex(this.expressionContext(), expr);
+    return emitIntegerIndex(this.expressionContext(), expr);
   }
 
   private emitBytesIndex(receiver: string, index: string, integerIndex = false): string {

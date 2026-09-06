@@ -74,8 +74,9 @@ export function dynDesc(
   }
 }
 
-/** Whether evaluating an index/value expression can overwrite a bytes
- * receiver binding. Deliberately conservative: uncertain shapes are false. */
+/** Whether evaluating an index/value expression can overwrite a container
+ * receiver binding — the precondition for borrowing the receiver instead of
+ * retaining it. Deliberately conservative: uncertain shapes are false. */
 export function isStableBytesOperand(e: IrExpr, receiverLocalId: string): boolean {
   switch (e.kind) {
     case "numLit":
@@ -100,6 +101,17 @@ export function isStableBytesOperand(e: IrExpr, receiverLocalId: string): boolea
       return (e.method === "get" || e.method === "length" || e.method === "byteLength") &&
         e.receiver.kind === "varRef" &&
         e.args.every((arg) => isStableBytesOperand(arg, receiverLocalId));
+    // A scalar element read runs no user code: it can trap, but it cannot
+    // reach an assignment to the receiver binding. Ref elements are
+    // excluded — their retain is fine, but keeping the rule to scalars
+    // matches where the borrow is actually claimed.
+    case "arrayGet":
+      return e.arr.type.kind === "array" &&
+        (e.arr.type.elem.kind === "f64" || e.arr.type.elem.kind === "bool") &&
+        e.arr.kind === "varRef" &&
+        isStableBytesOperand(e.index, receiverLocalId);
+    case "arrIntrinsic":
+      return e.method === "length" && e.receiver.kind === "varRef";
     default:
       return false;
   }
