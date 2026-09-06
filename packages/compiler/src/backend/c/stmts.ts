@@ -9,8 +9,8 @@ import { mangleField, mangleGlobal, mangleLocal, mangleRawParam } from "../mangl
 import { BOOL, CAUGHT, IrExpr, IrStmt, RUNTIME_ERROR_CLASSES, isRefCounted } from "../../ir/ir.js";
 import { boxAccess, cDecl, cStringLiteral, elemAccess, vAdapters } from "./types.js";
 import { OVERFLOW_MEMBER } from "./shapes.js";
-import { emitBytesReceiver } from "./exprs.js";
-import { matchIntegerBytesForLoop } from "../../ir/integer-loops.js";
+import { emitArrayReceiver, emitBytesReceiver } from "./exprs.js";
+import { integerIndexExpr, matchIntegerForLoop } from "../../ir/integer-loops.js";
 import { endsWithJump, matchStringSelfConcat } from "../../ir/analysis.js";
 
 
@@ -31,6 +31,13 @@ export function emitFunction(emitter: CEmitter, fn: IrFunction): void {
     emitter.currentLocals = new Map(fn.locals.map((l) => [l.id, l]));
     emitter.captureIds = new Set((fn.captures ?? []).map((c) => c.localId));
     emitter.integerLoopBindings.clear();
+    // Local ids are unique only WITHIN a function, so a stale entry would
+    // let the next function treat an unrelated number local as a proven
+    // integer. Integer `const` GLOBALS ("%g." ids) are program-wide and
+    // stay seeded. Mirrored in the LLVM emitter.
+    for (const id of [...emitter.integerBindings.keys()]) {
+      if (!id.startsWith("%g.")) emitter.integerBindings.delete(id);
+    }
 
     emitter.line(`${emitter.signature(fn)} {${emitter.srcComment(fn.loc)}`);
     emitter.indent++;
@@ -209,9 +216,19 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
           emitter.line(`scr_box_set_${boxAccess(local.type)}(${target}, ${v.name});`);
           break;
         }
+        // A `const` whose initializer is a proven non-negative integer
+        // keeps that fact at every later use, so `const idx = i * N + j`
+        // still indexes in integers. Only immutable unboxed number
+        // bindings qualify; the proof is taken against the initializer
+        // BEFORE it is emitted, and recorded after, so the binding cannot
+        // prove itself.
+        const integerBound = !local.mutable && !local.boxed && local.type.kind === "f64"
+          ? integerIndexExpr(s.init, emitter)
+          : null;
         const v = emitter.emitExpr(s.init);
         emitter.moveTemp(v);
         emitter.line(`${target} = ${v.name};${emitter.srcComment(s.loc)}`);
+        if (integerBound) emitter.integerBindings.set(s.localId, { max: integerBound.max });
         if (isRefCounted(v.type)) {
           emitter.scopes[emitter.scopes.length - 1]!.push({ name: target, type: v.type });
         }
@@ -341,7 +358,7 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
       case "for": {
         // Desugared in place; the init's scope wraps the whole loop, so
         // break/continue must NOT release it (scopeDepth captured after).
-        const integerLoop = matchIntegerBytesForLoop(s, emitter.currentLocals);
+        const integerLoop = matchIntegerForLoop(s, emitter.currentLocals, emitter);
         emitter.line(`{${emitter.srcComment(s.loc)}`);
         emitter.indent++;
         emitter.scopes.push([]);
@@ -349,15 +366,20 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
         if (integerLoop) {
           integerShadow = `sc_i${emitter.tempCounter++}`;
           emitter.line(`uint64_t ${integerShadow} = 0; /* integer induction ${emitter.currentLocals.get(integerLoop.localId)!.name} */`);
-          emitter.integerLoopBindings.set(integerLoop.localId, integerShadow);
+          emitter.integerLoopBindings.set(integerLoop.localId, { code: integerShadow, max: integerLoop.max });
         } else if (s.init) {
           emitter.emitStmt(s.init);
         }
         emitter.line(`for (;;) {`);
         emitter.indent++;
-        if (integerLoop && integerShadow) {
+        if (integerLoop && integerShadow && integerLoop.limitReceiver) {
           const receiver = emitBytesReceiver(emitter, integerLoop.limitReceiver, []);
           emitter.line(`if (!(${integerShadow} < ${receiver.name}->len)) break;`);
+        } else if (integerLoop && integerShadow && integerLoop.limitExpr) {
+          // Re-evaluated per iteration exactly as JS does; both sides are
+          // proven integers below 2^53, so the u64 test is the f64 test.
+          const limit = integerIndexExpr(integerLoop.limitExpr, emitter)!;
+          emitter.line(`if (!(${integerShadow} < ${emitter.renderIntegerIndex(limit.node)})) break;`);
         } else if (s.cond) {
           const cond = emitter.emitCondition(s.cond);
           emitter.line(`if (!(${cond})) break;`);
@@ -404,13 +426,21 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
         // Evaluation order matches JS: array, index, then value. Ownership
         // of a refcounted value moves into the array (the runtime releases
         // the replaced element itself).
-        const arr = emitter.emitExpr(s.arr);
-        const idx = emitter.emitExpr(s.index);
-        const v = emitter.emitExpr(s.value);
         if (s.arr.type.kind !== "array") throw new InternalCompilerError("emitter bug: arraySet on non-array");
         const acc = elemAccess(s.arr.type.elem);
-        if (acc === "ref") emitter.moveTemp(v);
-        emitter.line(`scr_arr_set_${acc}(${arr.name}, ${idx.name}, ${v.name});${emitter.srcComment(s.loc)}`);
+        const arr = emitArrayReceiver(emitter, s.arr, [s.index, s.value]);
+        const integerIndex = acc === "ref" ? null : emitter.integerIndex(s.index);
+        const idx = integerIndex ?? emitter.emitExpr(s.index).name;
+        const v = emitter.emitExpr(s.value);
+        if (acc === "ref") {
+          emitter.moveTemp(v);
+          emitter.line(`scr_arr_set_ref(${arr.name}, ${idx}, ${v.name});${emitter.srcComment(s.loc)}`);
+          break;
+        }
+        // Scalar stores go through the TU-local inline accessor (the
+        // appending i == len case falls back to the runtime).
+        const helper = emitter.arrElementHelper("set", acc, integerIndex !== null);
+        emitter.line(`${helper}(${arr.name}, ${idx}, ${v.name});${emitter.srcComment(s.loc)}`);
         break;
       }
       case "bytesSet": {
@@ -420,7 +450,7 @@ export function emitStmt(emitter: CEmitter, s: IrStmt): void {
         // append. The IR carries the element kind; do not rediscover it in
         // the generic runtime accessor on every loop iteration.
         const arr = emitBytesReceiver(emitter, s.arr, [s.index, s.value]);
-        const integerIndex = emitter.integerLoopIndex(s.index);
+        const integerIndex = emitter.integerIndex(s.index);
         const idx = integerIndex === null ? emitter.emitExpr(s.index).name : integerIndex;
         const v = emitter.emitExpr(s.value);
         if (s.arr.type.kind !== "bytes") throw new InternalCompilerError("emitter bug: bytesSet on non-bytes");

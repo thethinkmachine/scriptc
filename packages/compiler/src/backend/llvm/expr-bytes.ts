@@ -1,7 +1,7 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
 import { isStableBytesOperand } from "../../ir/analysis.js";
-import { F64, IrBytesElem, IrExpr } from "../../ir/ir.js";
+import { bytesElemWidth, F64, IrBytesElem, IrExpr } from "../../ir/ir.js";
 import type { LlvmEmitterContext, LlValue } from "./expr-context.js";
 import { F64_INF, f64Lit } from "./common.js";
 
@@ -70,10 +70,10 @@ export function emitBytesReceiver(host: LlvmEmitterContext, receiver: IrExpr, fo
 
 export function emitIntegerLoopIndex(host: LlvmEmitterContext, expr: IrExpr): string | null {
     if (expr.kind !== "varRef") return null;
-    const slot = host.integerLoopBindings.get(expr.localId);
-    if (slot === undefined) return null;
+    const binding = host.integerLoopBindings.get(expr.localId);
+    if (binding === undefined) return null;
     const index = host.B.tmp();
-    host.B.line(`${index} = load ${host.sizeType}, ptr ${slot}`);
+    host.B.line(`${index} = load ${host.sizeType}, ptr ${binding.slot}`);
     return index;
   }
 
@@ -144,8 +144,10 @@ export function emitBytesLength(host: LlvmEmitterContext, elem: IrBytesElem, rec
     const len = B.tmp();
     B.line(`${p} = getelementptr inbounds %ScrBytes, ptr ${receiver}, i64 0, i32 1`);
     B.line(`${len} = load ${host.sizeType}, ptr ${p}`);
-    const count = bytes && elem !== "u8" ? B.tmp() : len;
-    if (count !== len) B.line(`${count} = shl ${host.sizeType} ${len}, 2`);
+    // byteLength scales the ELEMENT count by the element width.
+    const shift = { 1: 0, 4: 2, 8: 3 }[bytesElemWidth(elem)];
+    const count = bytes && shift !== 0 ? B.tmp() : len;
+    if (count !== len) B.line(`${count} = shl ${host.sizeType} ${len}, ${shift}`);
     const out = B.tmp();
     B.line(`${out} = uitofp ${host.sizeType} ${count} to double`);
     return { name: out, type: F64 };
@@ -172,6 +174,13 @@ export function emitBytesGet(host: LlvmEmitterContext, elem: IrBytesElem, receiv
       B.line(`${p} = getelementptr inbounds float, ptr ${data}, ${host.sizeType} ${idx}`);
       B.line(`${raw} = load float, ptr ${p}, align 1`);
       B.line(`${out} = fpext float ${raw} to double`);
+      return { name: out, type: F64 };
+    }
+    if (elem === "f64") {
+      // The value IS the element — a plain load, no widening.
+      const out = B.tmp();
+      B.line(`${p} = getelementptr inbounds double, ptr ${data}, ${host.sizeType} ${idx}`);
+      B.line(`${out} = load double, ptr ${p}, align 1`);
       return { name: out, type: F64 };
     }
     const raw = B.tmp();
@@ -252,7 +261,7 @@ export function emitBytesU32(host: LlvmEmitterContext, value: string): string {
 export function emitBytesSet(host: LlvmEmitterContext, elem: IrBytesElem, receiver: string, index: string, value: string, integerIndex = false): void {
     const B = host.B;
     const idx = host.emitBytesIndex(receiver, index, integerIndex);
-    const stored = elem === "f32" ? null : host.emitBytesU32(value);
+    const stored = elem === "f32" || elem === "f64" ? null : host.emitBytesU32(value);
     const data = host.emitBytesData(receiver);
     const p = B.tmp();
     if (elem === "u8") {
@@ -267,6 +276,12 @@ export function emitBytesSet(host: LlvmEmitterContext, elem: IrBytesElem, receiv
       B.line(`${narrowed} = fptrunc double ${value} to float`);
       B.line(`${p} = getelementptr inbounds float, ptr ${data}, ${host.sizeType} ${idx}`);
       B.line(`store float ${narrowed}, ptr ${p}, align 1`);
+      return;
+    }
+    if (elem === "f64") {
+      // No coercion: Float64Array stores the double as-is, NaN included.
+      B.line(`${p} = getelementptr inbounds double, ptr ${data}, ${host.sizeType} ${idx}`);
+      B.line(`store double ${value}, ptr ${p}, align 1`);
       return;
     }
     B.line(`${p} = getelementptr inbounds i32, ptr ${data}, ${host.sizeType} ${idx}`);

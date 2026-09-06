@@ -28,7 +28,15 @@ export interface SrcLoc {
  * the constructors real CLI code reaches (Uint8Array/Buffer, Uint32Array,
  * Int32Array — the Atomics.wait sleep idiom's array — Float32Array). The
  * other TypedArray flavors stay frontend-fenced. */
-export type IrBytesElem = "u8" | "u32" | "i32" | "f32";
+export type IrBytesElem = "u8" | "u32" | "i32" | "f32" | "f64";
+
+/** Element width in bytes for a typed-array element kind — the runtime's
+ * scr_bytes_elem_size. The single source of truth: byteLength, the
+ * ArrayBuffer-length divisibility rule, and both backends' element address
+ * arithmetic all read it, so a new element kind cannot be half-added. */
+export function bytesElemWidth(elem: IrBytesElem): 1 | 4 | 8 {
+  return elem === "u8" ? 1 : elem === "f64" ? 8 : 4;
+}
 
 export type IrType =
   | { kind: "f64" }

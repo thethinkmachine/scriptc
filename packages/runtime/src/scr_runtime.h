@@ -950,6 +950,11 @@ double scr_math_round(double x);
 double scr_math_max(double a, double b);
 double scr_math_random(void);
 
+/* The out-of-line OOB trap. Public so a generated TU can inline the
+ * checked element fast path (see the C backend's arrElementHelpers) and
+ * still produce the byte-identical RangeError on the cold path. */
+_Noreturn void scr_arr_trap_index(double i, size_t len);
+
 double scr_arr_get_f64(ScrArr *a, double i); /* trap OOB */
 bool scr_arr_get_bool(ScrArr *a, double i);  /* trap OOB */
 void *scr_arr_get_ref(ScrArr *a, double i);  /* trap OOB; returns +1 */
@@ -4822,6 +4827,11 @@ typedef enum ScrBytesElem {
   SCR_BYTES_U32, /* Uint32Array */
   SCR_BYTES_F32, /* Float32Array */
   SCR_BYTES_I32, /* Int32Array (reads sign-extend; writes ToInt32-wrap) */
+  /* Float64Array: the ONE 8-byte element kind, and the only one whose
+   * element write is lossless — a store of the double itself, with no
+   * ToUint32 wrap and no float rounding. Appended last so the numeric kind
+   * the compiler passes stays stable for the four that came before. */
+  SCR_BYTES_F64,
 } ScrBytesElem;
 
 typedef struct ScrBytes {
@@ -4836,7 +4846,7 @@ typedef struct ScrBytes {
   struct ScrBytes *backing;
 } ScrBytes;
 
-size_t scr_bytes_elem_size(ScrBytesElem elem); /* 1, 4, 4 */
+size_t scr_bytes_elem_size(ScrBytesElem elem); /* 1, 4, 4, 4, 8 */
 
 /* node:string_decoder's StringDecoder (scr_bytes.c, beside the decoders
  * it shares): the decoder value is a record holding the CANONICAL

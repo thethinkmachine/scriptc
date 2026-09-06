@@ -9642,6 +9642,7 @@ ScrJsval *scr_jsval_from_bytes(const ScrBytes *b) {
   JSValue v = JS_NewTypedArray(isl_ctx, 3, argv,
                                b->elem == SCR_BYTES_U32   ? JS_TYPED_ARRAY_UINT32
                                : b->elem == SCR_BYTES_I32 ? JS_TYPED_ARRAY_INT32
+                               : b->elem == SCR_BYTES_F64 ? JS_TYPED_ARRAY_FLOAT64
                                                           : JS_TYPED_ARRAY_FLOAT32);
   JS_FreeValue(isl_ctx, buf);
   if (JS_IsException(v)) {

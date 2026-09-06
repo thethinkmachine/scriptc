@@ -1,20 +1,23 @@
 /* Focused LLVM expression emission extracted from emitter.ts. */
 import { InternalCompilerError } from "../../errors.js";
 import { matchStringSelfConcat, undefinedArmTag } from "../../ir/analysis.js";
-import { isRefCounted } from "../../ir/ir.js";
+import { isRefCounted, type IrBytesElem } from "../../ir/ir.js";
 import { mangleRecordClone, mangleRecordNew } from "../mangle.js";
 import { arrNewCall, elemAccess } from "./shapes.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import type { LlvmEmitterContext, ExprOf, LlValue } from "./expr-context.js";
 
 /** ScrBytesElem (scr_runtime.h): U8, U32, F32, I32. */
-const BYTES_ELEM_NUM: Record<"u8" | "u32" | "f32" | "i32", number> = {
+const BYTES_ELEM_NUM: Record<IrBytesElem, number> = {
   u8: 0,
   u32: 1,
   f32: 2,
   i32: 3,
+  f64: 4,
 };
 import { f64Lit } from "./common.js";
+import { emitBytesReceiver } from "./expr-bytes.js";
+import { emitArrGetScalar, emitIntegerIndex } from "./expr-array-elem.js";
 
 export function emitLiteralExpr(host: LlvmEmitterContext, e: ExprOf<"numLit" | "boolLit" | "strLit" | "unitLit" | "varRef">): LlValue {
     const B = host.B;
@@ -32,11 +35,11 @@ export function emitLiteralExpr(host: LlvmEmitterContext, e: ExprOf<"numLit" | "
         // tag-only); one reaching the generic dispatch escaped its wrap.
         throw new InternalCompilerError(`llvm emitter bug: bare unitLit '${e.unit}'`);
       case "varRef": {
-        const integerSlot = host.integerLoopBindings.get(e.localId);
-        if (integerSlot !== undefined) {
+        const integerBinding = host.integerLoopBindings.get(e.localId);
+        if (integerBinding !== undefined) {
           const integer = B.tmp();
           const number = B.tmp();
-          B.line(`${integer} = load ${host.sizeType}, ptr ${integerSlot}`);
+          B.line(`${integer} = load ${host.sizeType}, ptr ${integerBinding.slot}`);
           B.line(`${number} = uitofp ${host.sizeType} ${integer} to double`);
           return { name: number, type: e.type };
         }
@@ -437,16 +440,24 @@ export function emitContainerExpr(host: LlvmEmitterContext, e: ExprOf<"arrayLit"
         return out;
       }
       case "arrayGet": {
-        const arr = host.emitExpr(e.arr);
-        const idx = host.emitExpr(e.index);
         if (e.arr.type.kind !== "array") throw new InternalCompilerError("llvm emitter bug: arrayGet on non-array");
+        const acc = elemAccess(e.arr.type.elem);
+        // Scalar elements: borrow the receiver (the binding's owner keeps
+        // it alive across the access) and inline the checked load, so the
+        // optimizer can see through the whole element access.
+        if (acc !== "ref") {
+          const recv = emitBytesReceiver(host, e.arr, [e.index]);
+          const integerIndex = emitIntegerIndex(host, e.index);
+          const idx = integerIndex ?? host.emitExpr(e.index).name;
+          return emitArrGetScalar(host, acc, recv.name, idx, integerIndex !== null);
+        }
         // Ref-element reads return +1 (the runtime retains); own registers
         // the owned temp in the frame like any other.
-        const acc = elemAccess(e.arr.type.elem);
-        const accTy = acc === "f64" ? "double" : acc === "bool" ? "i1" : "ptr";
-        host.declare(`declare ${acc === "bool" ? "zeroext i1" : accTy} @scr_arr_get_${acc}(ptr, double)`);
+        const arr = host.emitExpr(e.arr);
+        const idx = host.emitExpr(e.index);
+        host.declare(`declare ptr @scr_arr_get_ref(ptr, double)`);
         const t = B.tmp();
-        B.line(`${t} = call ${accTy} @scr_arr_get_${acc}(ptr ${arr.name}, double ${idx.name})`);
+        B.line(`${t} = call ptr @scr_arr_get_ref(ptr ${arr.name}, double ${idx.name})`);
         return host.own({ name: t, type: e.type });
       }
       case "arrIntrinsic":
